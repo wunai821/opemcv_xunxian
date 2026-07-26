@@ -1,0 +1,43 @@
+%YAML:1.0
+---
+# 摄像头采集参数
+camera_width: 640
+camera_height: 480
+camera_fps: 30
+
+# 处理分辨率与 ROI
+process_width: 320
+process_height: 240
+roi_top_ratio: 0.35
+roi_bottom_ratio: 0.98
+
+# 0：浅色赛道/深色背景；1：深色线/浅色背景
+# 当前赛道是白纸黑线，因此默认反相二值化。
+dark_line: 1
+blur_size: 5
+morph_size: 3
+min_track_width: 8
+max_track_width: 300
+search_radius: 100
+max_missing_rows: 18
+center_smoothing: 0.25
+
+# 路口矩形探测框与多帧防抖
+probe_inset_ratio: 0.08
+probe_min_run: 6
+feature_confirm_frames: 3
+feature_clear_frames: 6
+
+# 每次确认节点时依次选择动作，循环使用
+route: "RIGHT,STRAIGHT,LEFT,STRAIGHT"
+
+# PID 与速度（归一化到 -1..1 / 0..1）
+kp: 0.85
+ki: 0.0
+kd: 0.12
+max_steer: 1.0
+base_speed: 0.35
+min_speed: 0.16
+lost_stop_seconds: 0.5
+
+serial_baud: 115200
