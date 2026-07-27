@@ -67,7 +67,7 @@ struct LineResult {
 
 class LineFollower {
 public:
-    explicit LineFollower(VisionConfig config);
+    explicit LineFollower(const VisionConfig& config);
     LineResult process(const cv::Mat& frame);
     cv::Mat drawDebug(const cv::Mat& frame, const LineResult& result) const;
 
@@ -78,8 +78,11 @@ private:
     RoadFeature latched_feature_ = RoadFeature::None;
     int candidate_frames_ = 0;
     int clear_frames_ = 0;
+    cv::Mat resized_buffer_;
+    cv::Mat gray_buffer_;
+    cv::Mat morph_kernel_;
 
-    cv::Mat makeBinary(const cv::Mat& roi_bgr) const;
+    void makeBinary(const cv::Mat& roi_bgr, cv::Mat& binary);
     RoadFeature detectFeature(const cv::Mat& binary, PathExits& exits) const;
     void updateFeatureState(LineResult& result);
     void buildGuide(LineResult& result) const;

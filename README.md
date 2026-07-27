@@ -85,13 +85,25 @@ sudo usermod -aG video "$USER"
 - `probe_min_run` 是认定出口所需的最短连续像素，噪声误报时可适当增大。
 - `feature_confirm_frames` 是路口确认帧数，`feature_clear_frames` 是离开路口解锁帧数。
 - `route` 是节点动作序列，例如 `RIGHT,STRAIGHT,LEFT,STRAIGHT`，走完后循环。
-- 先以较低的 `base_speed` 测试，再依次调整 `kp`、`kd`；通常保持 `ki: 0.0`。
+- `base_speed`、`min_speed` 的单位是 m/s；先以较低速度测试，再调整 `kp`、`kd`。
+- `max_omega_rad_s` 是普通循线最大角速度，`turn_omega_rad_s` 和
+  `turn_duration_seconds` 控制直角转向的角速度和最短执行时间，必须结合实车调节。
+- `max_accel_m_s2`、`max_decel_m_s2` 和 `max_omega_accel_rad_s2` 限制
+  `v、w` 的突变；确定丢线或故障锁停不经过斜坡，直接输出零。
+- 相邻视觉控制帧间隔超过 `control_timeout_seconds` 会锁停，防止摄像头或处理链
+  卡顿后又拿旧状态重新启动车辆。
+- 节点动作超过 `turn_timeout_seconds` / `straight_timeout_seconds` 仍未重新找到
+  赛道时会锁停，不会一直盲走。重新启动程序前应先检查识别和参数。
+- 动作达到最短时间后，还要连续 `maneuver_reacquire_frames` 帧满足“找到线且不再是
+  路口”，且置信度、转向量满足 `reacquire_min_confidence`、
+  `reacquire_max_steering`，才会回到普通循线。发现新赛道后会先交回视觉闭环校正，
+  不再持续盲转。
 
 控制符号约定：
 
 - `error` 和 `steering` 范围均为 `-1.0 ~ +1.0`。
 - 负数表示赛道在左侧/向左转，正数表示赛道在右侧/向右转。
-- `speed` 范围为 `0.0 ~ 1.0`，弯道会自动降速。
+- `speed` 单位为 m/s，弯道会自动降速。
 - 连续丢线超过 `lost_stop_seconds` 后速度降为 0。
 
 ## 连接下位机
@@ -105,45 +117,47 @@ sudo usermod -aG dialout "$USER"
   --serial /dev/ttyUSB0 --headless
 ```
 
-串口为 8N1，默认 115200 baud，每帧发送一行 ASCII：
+通信严格使用 H7 UART7 底盘速度协议：`1,000,000 baud、8N1、无流控、3.3V TTL`。
+视觉端 TX 连接 H7 UART7_RX，并且双方 GND 共地。不要把 5V 串口电平直接接入 H7。
+
+每帧固定 8 字节，不发送 ASCII 文本：
+
+| 字节 | 内容 |
+|---:|---|
+| 0 | `0xA5` |
+| 1 | `0x5A` |
+| 2～3 | `int16_t velocity_x_mm_s`，小端 |
+| 4～5 | `int16_t omega_mrad_s`，小端 |
+| 6～7 | 字节 0～5 的 CRC16/MODBUS，小端 |
+
+符号规定：`Vx > 0` 前进；`Omega > 0` 左转；`Omega < 0` 右转；两者为 0 停止。
+串口层只负责可靠传输最终 `v、w`，不直接承担决策。正常循线时，运动监督器把 PD
+输出转换为 `v、w`；识别角点或路口后，根据 `route` 选择动作并进入节点状态机，
+不再发送 `$NODE`。
+
+默认转换如下：
 
 ```text
-$CTRL,<steering>,<speed>,<confidence>
+Vx = speed(m/s) × 1000
+Omega = -steering × max_omega_rad_s × 1000
 ```
 
-例如：
+负号用于转换方向约定：视觉内部左转为负，而 H7 协议左转为正。左右转动作至少执行
+`turn_duration_seconds`，直行节点至少执行 `straight_node_seconds`。达到最短时间后
+不会立刻退出动作，而是等待视觉稳定重捕获普通赛道；未在各自超时时间内重捕获则
+进入不可自动恢复的故障锁停。
+
+程序随摄像头帧率发送，默认 30 FPS 即约 33 ms 一帧，满足协议建议的 20～50 ms。
+串口后台线程只保留最新速度帧，避免积压过期控制量。串口刚打开以及程序正常退出、
+异常退出时都会发送协议停车帧：
 
 ```text
-$CTRL,-0.235,0.280,0.910
+A5 5A 00 00 00 00 40 E3
 ```
 
-确认新的角点或路口时额外发送一次：
-
-```text
-$NODE,<feature>,<action>,<exits_mask>,<confidence>
-```
-
-例如：
-
-```text
-$NODE,CROSSROAD,RIGHT,15,0.960
-```
-
-`feature` 可为 `CORNER_LEFT`、`CORNER_RIGHT`、`BRANCH_LEFT`、
-`BRANCH_RIGHT`、`T_JUNCTION` 或 `CROSSROAD`。`action` 可为 `LEFT`、
-`RIGHT`、`STRAIGHT`，无可用出口时为 `STOP`。
-
-普通角点动作由角点方向决定，不消耗 `route`；其余节点从 `route` 依次取动作。如果规划
-动作在当前路口不存在，程序按直行、左、右的顺序选择一个实际存在的出口。
-
-`exits_mask` 的位定义为 `bit0=下方来路`、`bit1=上方直行`、`bit2=左侧出口`、
-`bit3=右侧出口`。常见值为：左角 `5`、右角 `9`、左支路 `7`、右支路 `11`、
-T 字 `13`、十字 `15`。
-
-下位机应将 `steering` 映射到舵机或差速转向，将 `speed` 映射到电机 PWM。收到
-`$NODE` 后进入自己的转弯状态机，在转弯完成前可忽略后续 `$CTRL`，完成后再恢复普通
-循线控制。下位机必须实现串口超时停车保护。程序正常退出时会额外发送
-`$CTRL,0.000,0.000,0.000`。
+串口后台写失败会使主循环立即报错退出，H7 连续 200 ms 未收到 CRC 正确的帧会自动
+停车。代码同时按协议限制
+`|Vx| <= 1000 mm/s`、`|Omega| <= 6000 mrad/s`。
 
 ## 上车前检查
 

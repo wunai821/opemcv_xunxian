@@ -1,13 +1,17 @@
 #include "controller.hpp"
 #include "line_follower.hpp"
+#include "motion_supervisor.hpp"
 #include "serial_port.hpp"
 
 #include <opencv2/highgui.hpp>
 #include <opencv2/videoio.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <csignal>
+#include <cstdint>
 #include <cstdlib>
 #include <iomanip>
 #include <iostream>
@@ -58,7 +62,7 @@ bool actionAvailable(const std::string& action, const xunji::PathExits& exits) {
 
 std::string chooseAction(const xunji::LineResult& line,
                          const std::vector<std::string>& route,
-                         std::size_t& route_index) {
+                         std::size_t route_index) {
     if (line.feature == xunji::RoadFeature::CornerLeft) {
         return "LEFT";
     }
@@ -67,7 +71,6 @@ std::string chooseAction(const xunji::LineResult& line,
     }
 
     const std::string planned = route[route_index % route.size()];
-    ++route_index;
     if (actionAvailable(planned, line.exits)) {
         return planned;
     }
@@ -126,7 +129,7 @@ void readValue(const cv::FileStorage& fs, const char* name, T& value) {
 void loadConfig(const std::string& path, xunji::VisionConfig& vision,
                 xunji::ControllerConfig& control, int& camera_width,
                 int& camera_height, int& camera_fps, int& serial_baud,
-                std::string& route) {
+                std::string& route, xunji::MotionConfig& motion) {
     cv::FileStorage fs(path, cv::FileStorage::READ);
     if (!fs.isOpened()) {
         throw std::runtime_error("无法打开配置文件: " + path);
@@ -160,7 +163,34 @@ void loadConfig(const std::string& path, xunji::VisionConfig& vision,
     readValue(fs, "base_speed", control.base_speed);
     readValue(fs, "min_speed", control.min_speed);
     readValue(fs, "lost_stop_seconds", control.lost_stop_seconds);
+    readValue(fs, "max_velocity_m_s", motion.max_velocity_m_s);
+    readValue(fs, "max_omega_rad_s", motion.max_omega_rad_s);
+    readValue(fs, "max_accel_m_s2", motion.max_accel_m_s2);
+    readValue(fs, "max_decel_m_s2", motion.max_decel_m_s2);
+    readValue(fs, "max_omega_accel_rad_s2",
+              motion.max_omega_accel_rad_s2);
+    readValue(fs, "control_timeout_seconds",
+              motion.control_timeout_seconds);
+    readValue(fs, "turn_velocity_m_s", motion.turn_velocity_m_s);
+    readValue(fs, "turn_omega_rad_s", motion.turn_omega_rad_s);
+    readValue(fs, "turn_duration_seconds", motion.turn_duration_seconds);
+    readValue(fs, "turn_timeout_seconds", motion.turn_timeout_seconds);
+    readValue(fs, "straight_velocity_m_s", motion.straight_velocity_m_s);
+    readValue(fs, "straight_node_seconds", motion.straight_node_seconds);
+    readValue(fs, "straight_timeout_seconds",
+              motion.straight_timeout_seconds);
+    readValue(fs, "maneuver_reacquire_frames",
+              motion.maneuver_reacquire_frames);
+    readValue(fs, "reacquire_min_confidence",
+              motion.reacquire_min_confidence);
+    readValue(fs, "reacquire_max_steering",
+              motion.reacquire_max_steering);
     readValue(fs, "serial_baud", serial_baud);
+}
+
+std::int16_t clampInt16(double value, int minimum, int maximum) {
+    return static_cast<std::int16_t>(
+        std::clamp(static_cast<int>(std::lround(value)), minimum, maximum));
 }
 
 bool isCameraIndex(const std::string& input) {
@@ -178,10 +208,12 @@ int main(int argc, char** argv) {
         int camera_width = 640;
         int camera_height = 480;
         int camera_fps = 30;
-        int serial_baud = 115200;
+        int serial_baud = 1000000;
         std::string route_text = "STRAIGHT";
+        xunji::MotionConfig motion_config;
         loadConfig(options.config, vision_config, control_config, camera_width,
-                   camera_height, camera_fps, serial_baud, route_text);
+                   camera_height, camera_fps, serial_baud, route_text,
+                   motion_config);
         const std::vector<std::string> route = parseRoute(route_text);
 
         cv::VideoCapture capture;
@@ -206,9 +238,12 @@ int main(int argc, char** argv) {
 
         xunji::LineFollower follower(vision_config);
         xunji::Controller controller(control_config);
+        xunji::MotionSupervisor motion(motion_config);
         std::signal(SIGINT, stopHandler);
         std::signal(SIGTERM, stopHandler);
         auto previous_time = std::chrono::steady_clock::now();
+        constexpr auto status_interval = std::chrono::milliseconds(100);
+        auto previous_status_time = previous_time - status_interval;
         int frame_count = 0;
         std::size_t route_index = 0;
 
@@ -227,28 +262,59 @@ int main(int argc, char** argv) {
             const xunji::ControlCommand command =
                 controller.update(line.error, line.found ? line.confidence : 0.0,
                                   line.curvature, dt);
-            if (serial.isOpen()) {
-                serial.writeCommand(command.steering, command.speed,
-                                    line.confidence);
-            }
             if (line.feature_confirmed) {
                 const std::string action =
                     chooseAction(line, route, route_index);
                 std::cout << "\n节点确认: " << xunji::featureName(line.feature)
                           << " action=" << action
                           << " exits=" << line.exits.mask() << '\n';
-                if (serial.isOpen()) {
-                    serial.writeNode(line.feature, action, line.exits.mask(),
-                                     line.confidence);
+                if (!motion.startManeuver(action)) {
+                    std::cerr << "节点动作未启动，当前运动状态不允许新动作\n";
+                } else if (line.feature != xunji::RoadFeature::CornerLeft &&
+                           line.feature != xunji::RoadFeature::CornerRight) {
+                    ++route_index;
                 }
             }
 
-            std::cout << std::fixed << std::setprecision(3)
-                      << "\rerror=" << line.error
-                      << " confidence=" << line.confidence
-                      << " road=" << xunji::featureName(line.feature)
-                      << " steer=" << command.steering
-                      << " speed=" << command.speed << "   " << std::flush;
+            const xunji::MotionOutput output = motion.update(
+                command, line.found, line.confidence, line.feature, dt);
+            if (output.maneuver_completed) {
+                controller.reset();
+                std::cout << "\n节点动作完成: " << output.action
+                          << "，已重新找到赛道\n";
+            }
+            if (output.fault_triggered) {
+                std::cerr << "\n运动控制锁停: " << output.fault_reason
+                          << "；需排除问题并重启程序\n";
+            }
+
+            const std::int16_t velocity_x_mm_s =
+                clampInt16(output.velocity_m_s * 1000.0, -1000, 1000);
+            const std::int16_t omega_mrad_s =
+                clampInt16(output.omega_rad_s * 1000.0, -6000, 6000);
+            if (!options.serial_device.empty() &&
+                !serial.writeVelocity(velocity_x_mm_s, omega_mrad_s)) {
+                throw std::runtime_error(
+                    "串口发送失败，底盘将由 200 ms 通信看门狗停车");
+            }
+
+            // 终端刷新限制到 10 Hz，避免 SSH/串口终端输出拖慢视觉主循环。
+            if (now - previous_status_time >= status_interval) {
+                previous_status_time = now;
+                std::cout << std::fixed << std::setprecision(3)
+                          << "\rerror=" << line.error
+                          << " confidence=" << line.confidence
+                          << " road=" << xunji::featureName(line.feature)
+                          << " steer=" << command.steering
+                          << " v=" << velocity_x_mm_s << "mm/s"
+                          << " w=" << omega_mrad_s << "mrad/s"
+                          << " mode=" << xunji::motionModeName(output.mode)
+                          << (output.action.empty()
+                                  ? ""
+                                  : " action=" + output.action)
+                          << "   "
+                          << std::flush;
+            }
 
             if (!options.headless) {
                 cv::Mat debug = follower.drawDebug(frame, line);
@@ -263,7 +329,7 @@ int main(int argc, char** argv) {
         }
 
         if (serial.isOpen()) {
-            serial.writeCommand(0.0, 0.0, 0.0);
+            serial.writeVelocity(0, 0);
         }
         std::cout << "\n已停止，共处理 " << frame_count << " 帧\n";
         return 0;

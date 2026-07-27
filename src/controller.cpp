@@ -5,7 +5,7 @@
 
 namespace xunji {
 
-Controller::Controller(ControllerConfig config) : config_(config) {}
+Controller::Controller(const ControllerConfig& config) : config_(config) {}
 
 ControlCommand Controller::update(double error, double confidence,
                                   double curvature, double dt_seconds) {
@@ -20,6 +20,9 @@ ControlCommand Controller::update(double error, double confidence,
         command.steering = std::clamp(previous_error_ * config_.kp,
                                       -config_.max_steer, config_.max_steer);
         integral_ = 0.0;
+        // 重捕获后的第一帧不能拿丢线前的误差计算微分，否则 dt 很小会
+        // 产生一次假的大角速度尖峰。
+        initialized_ = false;
         return command;
     }
 

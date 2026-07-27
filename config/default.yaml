@@ -31,13 +31,36 @@ feature_clear_frames: 6
 # 每次确认节点时依次选择动作，循环使用
 route: "RIGHT,STRAIGHT,LEFT,STRAIGHT"
 
-# PID 与速度（归一化到 -1..1 / 0..1）
+# 视觉 PD：steering 为 -1..1；速度单位为 m/s
 kp: 0.85
 ki: 0.0
 kd: 0.12
 max_steer: 1.0
 base_speed: 0.35
 min_speed: 0.16
-lost_stop_seconds: 0.5
+lost_stop_seconds: 0.20
 
-serial_baud: 115200
+# steering 映射到角速度；左转为正、右转为负
+max_velocity_m_s: 1.0
+max_omega_rad_s: 2.5
+
+# v、w 变化率限制，抑制视觉抖动或状态切换造成的速度突变
+max_accel_m_s2: 0.8
+max_decel_m_s2: 1.5
+max_omega_accel_rad_s2: 8.0
+control_timeout_seconds: 0.20
+
+# 节点动作：最短动作时间后必须连续重新识别到普通赛道，否则超时锁停
+turn_velocity_m_s: 0.08
+turn_omega_rad_s: 1.5
+turn_duration_seconds: 1.0
+turn_timeout_seconds: 2.0
+straight_velocity_m_s: 0.20
+straight_node_seconds: 0.4
+straight_timeout_seconds: 1.2
+maneuver_reacquire_frames: 3
+reacquire_min_confidence: 0.35
+reacquire_max_steering: 0.60
+
+# H7 UART7 固定 1 Mbps
+serial_baud: 1000000

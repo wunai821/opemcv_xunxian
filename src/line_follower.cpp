@@ -63,22 +63,24 @@ const char* featureName(RoadFeature feature) {
     return "NONE";
 }
 
-LineFollower::LineFollower(VisionConfig config) : config_(config) {
+LineFollower::LineFollower(const VisionConfig& config) : config_(config) {
     if (config_.process_width < 32 || config_.process_height < 32) {
         throw std::invalid_argument("process image is too small");
     }
     config_.blur_size = std::max(1, config_.blur_size | 1);
     config_.morph_size = std::max(1, config_.morph_size | 1);
+    morph_kernel_ = cv::getStructuringElement(
+        cv::MORPH_RECT, {config_.morph_size, config_.morph_size});
 }
 
-cv::Mat LineFollower::makeBinary(const cv::Mat& roi_bgr) const {
-    cv::Mat gray;
-    cv::cvtColor(roi_bgr, gray, cv::COLOR_BGR2GRAY);
-    cv::GaussianBlur(gray, gray, {config_.blur_size, config_.blur_size}, 0.0);
+void LineFollower::makeBinary(const cv::Mat& roi_bgr, cv::Mat& binary) {
+    cv::cvtColor(roi_bgr, gray_buffer_, cv::COLOR_BGR2GRAY);
+    cv::GaussianBlur(gray_buffer_, gray_buffer_,
+                     {config_.blur_size, config_.blur_size}, 0.0);
 
-    cv::Mat binary(gray.size(), CV_8UC1);
-    const int split1 = gray.rows / 3;
-    const int split2 = gray.rows * 2 / 3;
+    binary.create(gray_buffer_.size(), CV_8UC1);
+    const int split1 = gray_buffer_.rows / 3;
+    const int split2 = gray_buffer_.rows * 2 / 3;
     const int threshold_type =
         (config_.dark_line ? cv::THRESH_BINARY_INV : cv::THRESH_BINARY) |
         cv::THRESH_OTSU;
@@ -86,16 +88,13 @@ cv::Mat LineFollower::makeBinary(const cv::Mat& roi_bgr) const {
     // 与参考项目一致：远、中、近三区分别计算 Otsu，适应赛道纵向光照差异。
     for (const auto& range : {std::pair<int, int>{0, split1},
                               {split1, split2},
-                              {split2, gray.rows}}) {
-        cv::Mat src_part = gray.rowRange(range.first, range.second);
+                              {split2, gray_buffer_.rows}}) {
+        cv::Mat src_part = gray_buffer_.rowRange(range.first, range.second);
         cv::Mat dst_part = binary.rowRange(range.first, range.second);
         cv::threshold(src_part, dst_part, 0, 255, threshold_type);
     }
 
-    const cv::Mat kernel = cv::getStructuringElement(
-        cv::MORPH_RECT, {config_.morph_size, config_.morph_size});
-    cv::morphologyEx(binary, binary, cv::MORPH_CLOSE, kernel);
-    return binary;
+    cv::morphologyEx(binary, binary, cv::MORPH_CLOSE, morph_kernel_);
 }
 
 RoadFeature LineFollower::detectFeature(const cv::Mat& binary,
@@ -375,16 +374,18 @@ LineResult LineFollower::process(const cv::Mat& frame) {
         return result;
     }
 
-    cv::Mat resized;
-    cv::resize(frame, resized, {config_.process_width, config_.process_height});
+    cv::resize(frame, resized_buffer_,
+               {config_.process_width, config_.process_height});
     const int top = std::clamp(
-        static_cast<int>(std::lround(config_.roi_top_ratio * resized.rows)),
-        0, resized.rows - 2);
+        static_cast<int>(std::lround(config_.roi_top_ratio *
+                                     resized_buffer_.rows)),
+        0, resized_buffer_.rows - 2);
     const int bottom = std::clamp(
-        static_cast<int>(std::lround(config_.roi_bottom_ratio * resized.rows)),
-        top + 1, resized.rows);
-    result.roi = {0, top, resized.cols, bottom - top};
-    result.binary = makeBinary(resized(result.roi));
+        static_cast<int>(std::lround(config_.roi_bottom_ratio *
+                                     resized_buffer_.rows)),
+        top + 1, resized_buffer_.rows);
+    result.roi = {0, top, resized_buffer_.cols, bottom - top};
+    makeBinary(resized_buffer_(result.roi), result.binary);
     result.feature = detectFeature(result.binary, result.exits);
     updateFeatureState(result);
 

@@ -201,5 +201,17 @@ int main() {
     controller.update(0.0, 0.0, 0.0, 0.3);
     const auto lost = controller.update(0.0, 0.0, 0.0, 0.3);
     ok &= check(lost.speed == 0.0, "prolonged line loss should stop the car");
+
+    xunji::ControllerConfig derivative_config;
+    derivative_config.kp = 0.0;
+    derivative_config.ki = 0.0;
+    derivative_config.kd = 1.0;
+    xunji::Controller derivative_controller(derivative_config);
+    derivative_controller.update(0.5, 1.0, 0.0, 1.0 / 30.0);
+    derivative_controller.update(0.0, 0.0, 0.0, 1.0 / 30.0);
+    const auto reacquired = derivative_controller.update(
+        -0.5, 1.0, 0.0, 1.0 / 30.0);
+    ok &= check(std::abs(reacquired.steering) < 1e-9,
+                "line reacquisition must not create a derivative spike");
     return ok ? 0 : 1;
 }
