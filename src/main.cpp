@@ -202,7 +202,8 @@ cv::Mat makeWebPreview(const cv::Mat& debug, const cv::Mat& binary,
                        const xunji::LineResult& line,
                        const xunji::MotionOutput& output,
                        std::int16_t velocity_x_mm_s,
-                       std::int16_t omega_mrad_s, double fps) {
+                       std::int16_t omega_mrad_s, double camera_fps,
+                       double processing_fps) {
     cv::Mat binary_bgr;
     cv::cvtColor(binary, binary_bgr, cv::COLOR_GRAY2BGR);
     cv::resize(binary_bgr, binary_bgr, debug.size(), 0.0, 0.0,
@@ -222,7 +223,8 @@ cv::Mat makeWebPreview(const cv::Mat& debug, const cv::Mat& binary,
     status1 << std::fixed << std::setprecision(3)
             << "error=" << line.error << "  confidence=" << line.confidence
             << "  road=" << xunji::featureName(line.feature)
-            << std::setprecision(1) << "  FPS=" << fps;
+            << std::setprecision(1) << "  CAM FPS=" << camera_fps
+            << "  PROC FPS=" << processing_fps;
     std::ostringstream status2;
     status2 << "v=" << velocity_x_mm_s << " mm/s  w=" << omega_mrad_s
             << " mrad/s  mode=" << xunji::motionModeName(output.mode);
@@ -299,7 +301,8 @@ int main(int argc, char** argv) {
         auto previous_time = std::chrono::steady_clock::now();
         constexpr auto status_interval = std::chrono::milliseconds(100);
         auto previous_status_time = previous_time - status_interval;
-        double smoothed_fps = 0.0;
+        double smoothed_camera_fps = 0.0;
+        double smoothed_processing_fps = 0.0;
         int frame_count = 0;
         std::size_t route_index = 0;
 
@@ -315,12 +318,13 @@ int main(int argc, char** argv) {
             previous_time = now;
             if (dt > 0.0) {
                 const double instantaneous_fps = 1.0 / dt;
-                smoothed_fps = smoothed_fps <= 0.0
-                                   ? instantaneous_fps
-                                   : 0.9 * smoothed_fps +
-                                         0.1 * instantaneous_fps;
+                smoothed_camera_fps = smoothed_camera_fps <= 0.0
+                                          ? instantaneous_fps
+                                          : 0.9 * smoothed_camera_fps +
+                                                0.1 * instantaneous_fps;
             }
 
+            const auto processing_start = std::chrono::steady_clock::now();
             const xunji::LineResult line = follower.process(frame);
             const xunji::ControlCommand command =
                 controller.update(line.error, line.found ? line.confidence : 0.0,
@@ -341,6 +345,18 @@ int main(int argc, char** argv) {
 
             const xunji::MotionOutput output = motion.update(
                 command, line.found, line.confidence, line.feature, dt);
+            const double processing_seconds = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - processing_start)
+                                                  .count();
+            if (processing_seconds > 0.0) {
+                const double instantaneous_processing_fps =
+                    1.0 / processing_seconds;
+                smoothed_processing_fps = smoothed_processing_fps <= 0.0
+                                              ? instantaneous_processing_fps
+                                              : 0.9 * smoothed_processing_fps +
+                                                    0.1 *
+                                                        instantaneous_processing_fps;
+            }
             if (output.maneuver_completed) {
                 controller.reset();
                 std::cout << "\n节点动作完成: " << output.action
@@ -386,7 +402,8 @@ int main(int argc, char** argv) {
             if (web_server.hasViewers()) {
                 web_server.publish(makeWebPreview(
                     debug, line.binary, line, output, velocity_x_mm_s,
-                    omega_mrad_s, smoothed_fps));
+                    omega_mrad_s, smoothed_camera_fps,
+                    smoothed_processing_fps));
             }
             if (!options.headless) {
                 cv::imshow("opencv_xunji", debug);
