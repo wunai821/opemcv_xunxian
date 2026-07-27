@@ -1,9 +1,11 @@
 #include "controller.hpp"
 #include "line_follower.hpp"
+#include "mjpeg_server.hpp"
 #include "motion_supervisor.hpp"
 #include "serial_port.hpp"
 
 #include <opencv2/highgui.hpp>
+#include <opencv2/imgproc.hpp>
 #include <opencv2/videoio.hpp>
 
 #include <algorithm>
@@ -31,6 +33,7 @@ struct Options {
     std::string serial_device;
     bool headless = false;
     int max_frames = 0;
+    int web_port = 0;
 };
 
 std::vector<std::string> parseRoute(const std::string& text) {
@@ -89,6 +92,7 @@ void usage(const char* program) {
         << "  --video PATH       使用视频文件\n"
         << "  --serial DEVICE    输出控制指令到串口，例如 /dev/ttyS3\n"
         << "  --headless         不创建显示窗口\n"
+        << "  --web-port N       在端口 N 提供浏览器 MJPEG 预览\n"
         << "  --max-frames N     处理 N 帧后退出（0 为持续运行）\n"
         << "  --help             显示帮助\n";
 }
@@ -108,6 +112,7 @@ Options parseOptions(int argc, char** argv) {
         else if (arg == "--video") options.input = value();
         else if (arg == "--serial") options.serial_device = value();
         else if (arg == "--headless") options.headless = true;
+        else if (arg == "--web-port") options.web_port = std::stoi(value());
         else if (arg == "--max-frames") options.max_frames = std::stoi(value());
         else if (arg == "--help") {
             usage(argv[0]);
@@ -193,6 +198,48 @@ std::int16_t clampInt16(double value, int minimum, int maximum) {
         std::clamp(static_cast<int>(std::lround(value)), minimum, maximum));
 }
 
+cv::Mat makeWebPreview(const cv::Mat& debug, const cv::Mat& binary,
+                       const xunji::LineResult& line,
+                       const xunji::MotionOutput& output,
+                       std::int16_t velocity_x_mm_s,
+                       std::int16_t omega_mrad_s, double camera_fps,
+                       double processing_fps) {
+    cv::Mat binary_bgr;
+    cv::cvtColor(binary, binary_bgr, cv::COLOR_GRAY2BGR);
+    cv::resize(binary_bgr, binary_bgr, debug.size(), 0.0, 0.0,
+               cv::INTER_NEAREST);
+
+    cv::Mat preview;
+    cv::hconcat(debug, binary_bgr, preview);
+    cv::copyMakeBorder(preview, preview, 0, 58, 0, 0, cv::BORDER_CONSTANT,
+                       cv::Scalar(18, 18, 18));
+    cv::putText(preview, "TRACK", {8, 20}, cv::FONT_HERSHEY_SIMPLEX,
+                0.55, {0, 255, 0}, 2, cv::LINE_AA);
+    cv::putText(preview, "BINARY", {debug.cols + 8, 20},
+                cv::FONT_HERSHEY_SIMPLEX, 0.55, {255, 255, 255}, 2,
+                cv::LINE_AA);
+
+    std::ostringstream status1;
+    status1 << std::fixed << std::setprecision(3)
+            << "error=" << line.error << "  confidence=" << line.confidence
+            << "  road=" << xunji::featureName(line.feature)
+            << std::setprecision(1) << "  CAM FPS=" << camera_fps
+            << "  PROC FPS=" << processing_fps;
+    std::ostringstream status2;
+    status2 << "v=" << velocity_x_mm_s << " mm/s  w=" << omega_mrad_s
+            << " mrad/s  mode=" << xunji::motionModeName(output.mode);
+    if (!output.action.empty()) {
+        status2 << "  action=" << output.action;
+    }
+    cv::putText(preview, status1.str(), {8, debug.rows + 22},
+                cv::FONT_HERSHEY_SIMPLEX, 0.45, {230, 230, 230}, 1,
+                cv::LINE_AA);
+    cv::putText(preview, status2.str(), {8, debug.rows + 46},
+                cv::FONT_HERSHEY_SIMPLEX, 0.45, {0, 220, 255}, 1,
+                cv::LINE_AA);
+    return preview;
+}
+
 bool isCameraIndex(const std::string& input) {
     return !input.empty() &&
            input.find_first_not_of("0123456789") == std::string::npos;
@@ -236,6 +283,16 @@ int main(int argc, char** argv) {
             throw std::runtime_error("无法打开串口: " + options.serial_device);
         }
 
+        xunji::MjpegServer web_server;
+        if (options.web_port != 0 && !web_server.start(options.web_port)) {
+            throw std::runtime_error("无法启动网页预览端口: " +
+                                     std::to_string(options.web_port));
+        }
+        if (web_server.isRunning()) {
+            std::cout << "网页预览已启动: http://<香橙派IP>:"
+                      << web_server.port() << "\n";
+        }
+
         xunji::LineFollower follower(vision_config);
         xunji::Controller controller(control_config);
         xunji::MotionSupervisor motion(motion_config);
@@ -244,6 +301,8 @@ int main(int argc, char** argv) {
         auto previous_time = std::chrono::steady_clock::now();
         constexpr auto status_interval = std::chrono::milliseconds(100);
         auto previous_status_time = previous_time - status_interval;
+        double smoothed_camera_fps = 0.0;
+        double smoothed_processing_fps = 0.0;
         int frame_count = 0;
         std::size_t route_index = 0;
 
@@ -257,7 +316,15 @@ int main(int argc, char** argv) {
             const double dt =
                 std::chrono::duration<double>(now - previous_time).count();
             previous_time = now;
+            if (dt > 0.0) {
+                const double instantaneous_fps = 1.0 / dt;
+                smoothed_camera_fps = smoothed_camera_fps <= 0.0
+                                          ? instantaneous_fps
+                                          : 0.9 * smoothed_camera_fps +
+                                                0.1 * instantaneous_fps;
+            }
 
+            const auto processing_start = std::chrono::steady_clock::now();
             const xunji::LineResult line = follower.process(frame);
             const xunji::ControlCommand command =
                 controller.update(line.error, line.found ? line.confidence : 0.0,
@@ -278,6 +345,18 @@ int main(int argc, char** argv) {
 
             const xunji::MotionOutput output = motion.update(
                 command, line.found, line.confidence, line.feature, dt);
+            const double processing_seconds = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - processing_start)
+                                                  .count();
+            if (processing_seconds > 0.0) {
+                const double instantaneous_processing_fps =
+                    1.0 / processing_seconds;
+                smoothed_processing_fps = smoothed_processing_fps <= 0.0
+                                              ? instantaneous_processing_fps
+                                              : 0.9 * smoothed_processing_fps +
+                                                    0.1 *
+                                                        instantaneous_processing_fps;
+            }
             if (output.maneuver_completed) {
                 controller.reset();
                 std::cout << "\n节点动作完成: " << output.action
@@ -316,8 +395,17 @@ int main(int argc, char** argv) {
                           << std::flush;
             }
 
+            cv::Mat debug;
+            if (!options.headless || web_server.hasViewers()) {
+                debug = follower.drawDebug(frame, line);
+            }
+            if (web_server.hasViewers()) {
+                web_server.publish(makeWebPreview(
+                    debug, line.binary, line, output, velocity_x_mm_s,
+                    omega_mrad_s, smoothed_camera_fps,
+                    smoothed_processing_fps));
+            }
             if (!options.headless) {
-                cv::Mat debug = follower.drawDebug(frame, line);
                 cv::imshow("opencv_xunji", debug);
                 cv::imshow("binary", line.binary);
                 const int key = cv::waitKey(1);
@@ -331,6 +419,7 @@ int main(int argc, char** argv) {
         if (serial.isOpen()) {
             serial.writeVelocity(0, 0);
         }
+        web_server.stop();
         std::cout << "\n已停止，共处理 " << frame_count << " 帧\n";
         return 0;
     } catch (const std::exception& error) {

@@ -59,6 +59,39 @@ cd /xunji/opencv_xunji
 ./build/opencv_xunji --config config/default.yaml --camera 0 --headless
 ```
 
+### 浏览器远程预览
+
+香橙派没有显示器时，可在无头模式下同时启动 MJPEG 网页预览：
+
+```bash
+./build/opencv_xunji \
+  --config config/default.yaml \
+  --camera 0 \
+  --serial /dev/ttyUSB0 \
+  --headless \
+  --web-port 8080
+```
+
+查看香橙派局域网 IP：
+
+```bash
+hostname -I
+```
+
+电脑或手机与香橙派连接同一网络后，在浏览器打开：
+
+```text
+http://香橙派IP:8080
+```
+
+网页左侧显示循线叠加图，右侧显示二值图，底部显示当前 `error`、置信度、道路类型、
+`v`、`w` 和运动状态。没有浏览器连接时不会进行 JPEG 编码，避免无谓占用香橙派 CPU。
+该服务没有登录认证，只应在可信局域网使用。如果系统启用了防火墙，需要放行端口：
+
+```bash
+sudo ufw allow 8080/tcp
+```
+
 也可以用录制的视频离线调参：
 
 ```bash
@@ -175,6 +208,7 @@ A5 5A 00 00 00 00 40 E3
 --video PATH       视频文件
 --serial DEVICE    串口设备
 --headless         不创建窗口
+--web-port N       在端口 N 提供浏览器 MJPEG 预览
 --max-frames N     处理指定帧数后退出
 --help             帮助
 ```
