@@ -11,6 +11,7 @@ find_package(Threads REQUIRED)
 add_library(line_follower
     src/line_follower.cpp
     src/controller.cpp
+    src/mjpeg_server.cpp
     src/motion_supervisor.cpp
     src/serial_port.cpp
 )
